@@ -30,3 +30,69 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 251）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+## 实现说明（本分支产物）
+
+### 结构与算法
+
+代码位于 `src/main/java/com/example/gsb/prefix/`：
+
+- `PrefixCompressedStore<V>`：核心组件，块式 front coding。键按无符号字节序分块，
+  默认每块目标容量 8；块首（锚点）存完整键，块内其余条目只存
+  `公共前缀长度（与前一条键）+ 剩余后缀`。
+- 块在达到约 2 倍目标容量后分裂为两个接近全满的块，因此顺序加载时稳态块接近全满，
+  锚点开销仅约 1/8。
+- `LookupResult<V>`：点查结果，命中时值与全局条目位置；未命中时给出可插入位置。
+- `StoreEntry<V>`：遍历还原出的完整条目（完整键 + 值 + 全局下标）。
+- `StoreSnapshot<V>`：某一时刻的一致快照视图，可整体遍历。
+- `StorageStats`：条目数、平均前缀长度、压缩后总字节数、未压缩总字节数。
+- `CompressionReport`：压缩率测量与表格输出。
+
+### 关键设计
+
+- **点查**：先对各块锚点键二分定位所在块，再块内顺序还原比较；未命中返回
+  `insertionPoint`（范围 `[0, size]`）。
+- **按序遍历**：块内以前一条完整键 + `prefixLen/suffix` 增量还原，跨块从新锚点开始，
+  同时携带全局下标用于定位原始条目。
+- **删除重建**：写锁内解码受影响块（其余块不动）→ 移除目标 → 整块重编码，
+  邻接关系（含锚点提升）随重编码自动重建；块删空则整块移除。
+- **并发模型**：单把 `ReentrantLock` 串行化写操作，写以 copy-on-write 替换受影响的块，
+  再通过 `volatile` 快照整体发布；读操作（点查/遍历/统计）完全无锁，读到的是某个不可变
+  版本，键与值要么是旧值要么是新值，不会出现撕裂。
+
+### 使用示例
+
+```java
+var store = new PrefixCompressedStore<String>();
+store.put("user/0001".getBytes(UTF_8), "alice");
+
+LookupResult<String> hit  = store.lookup("user/0001".getBytes(UTF_8)); // found, value, position
+LookupResult<String> miss = store.lookup("user/0000".getBytes(UTF_8)); // insertionPoint
+
+for (StoreEntry<String> e : store) {
+    System.out.println(e.index() + ": " + e.keyAsUtf8() + " = " + e.value());
+}
+
+StorageStats stats = store.stats(); // entryCount / averagePrefixLength / compressedBytes
+```
+
+### 实测压缩率（5000 条，公共前缀长度递增，`CompressionRatioTest` 输出）
+
+| 场景 | 平均前缀长度(B) | 未压缩(B) | 压缩后(B) | 比率 | 节省 |
+|---|---:|---:|---:|---:|---:|
+| prefix=0 | 6.0 | 60004 | 34764 | 0.579 | 42.1% |
+| prefix=8 | 13.0 | 100004 | 39756 | 0.398 | 60.2% |
+| prefix=16 | 20.0 | 140004 | 44748 | 0.320 | 68.0% |
+| prefix=32 | 34.1 | 220004 | 54732 | 0.249 | 75.1% |
+| prefix=64 | 62.1 | 380004 | 74700 | 0.197 | 80.3% |
+| prefix=128 | 118.1 | 700004 | 114636 | 0.164 | 83.6% |
+
+即使无公共前缀，front coding 也能利用顺序数字键的公共部分；公共前缀越长压缩效果越好。
+
+### 测试覆盖
+
+- `PrefixCompressedStoreTest`：乱序插入与遍历还原、点查命中与可插入位置、
+  删除中间项/锚点/清空后的重建、统计口径、非法参数。
+- `ConcurrencyTest`：1 写线程 × 4 读线程并发 3000 次写操作，校验快照内键严格有序、
+  无撕裂键、值只能是旧值或新值、遍历条数与快照 size 一致。
+- `CompressionRatioTest`：不同公共前缀长度下的压缩率对比、单调性与节省下限断言。
